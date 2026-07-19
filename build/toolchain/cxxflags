@@ -1,0 +1,6 @@
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero
+"-specs=C:/Users/mina/Documents/cnam/zilina/odor_project/build/specs/picolibc.specs"
+-fno-rtti
