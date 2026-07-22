@@ -9,6 +9,12 @@
 #include "bsec_interface.h"
 #include "bsec_datatypes.h"
 
+// --- Ajouts pour la carte SD ---
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdspi_host.h"
+#include "driver/spi_common.h"
+
 static const char *TAG = "NOSE";
 
 // Handle global du device I2C, utilisé par les fonctions de lecture/écriture
@@ -16,6 +22,113 @@ static i2c_master_dev_handle_t dev_handle;
 
 // Structure globale du capteur BME68x, utilisée dans la boucle BSEC
 static struct bme68x_dev bme;
+
+// --- Configuration carte SD (SPI) ---
+// Pins du slot SD dedie de la XIAO ESP32-S3 Sense (expansion board) :
+// SCK=GPIO7, MISO=GPIO8, MOSI=GPIO9, CS=GPIO21 (fixe, documente par Seeed).
+// Ces pins sont partagees avec le connecteur SPI generique de la carte :
+// si tu utilises aussi du SPI ailleurs dans ton projet, tu ne peux pas
+// utiliser les deux en meme temps (voir doc Seeed, pastille J3).
+#define SD_PIN_MOSI   9
+#define SD_PIN_MISO   8
+#define SD_PIN_CLK    7
+#define SD_PIN_CS     43
+#define SD_MOUNT_POINT "/sdcard"
+#define SD_CSV_PATH    SD_MOUNT_POINT "/bme_log.csv"
+
+static sdmmc_card_t *sd_card = NULL;
+static uint32_t sample_index = 0;     // compteur global d'echantillons (sensor_index / data_point_id)
+static uint8_t  heater_step_cycle = 0; // pseudo heater_profile_step_index (0-9), voir remarque plus bas
+
+// Init de la carte SD en SPI + montage FATFS + creation de l'entete CSV si besoin
+static bool sd_init(void)
+{
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 2,
+        .allocation_unit_size = 16 * 1024
+    };
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = SD_PIN_MOSI,
+        .miso_io_num = SD_PIN_MISO,
+        .sclk_io_num = SD_PIN_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK) {
+        printf("Erreur spi_bus_initialize: %d\n", ret);
+        return false;
+    }
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SPI2_HOST;
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SD_PIN_CS;
+    slot_config.host_id = SPI2_HOST;
+
+    ret = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &host, &slot_config, &mount_config, &sd_card);
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            printf("Erreur : montage du systeme de fichiers SD echoue\n");
+        } else {
+            printf("Erreur : carte SD non initialisee (%s)\n", esp_err_to_name(ret));
+        }
+        return false;
+    }
+
+    // Ecrit l'entete CSV uniquement si le fichier n'existe pas encore
+    FILE *f = fopen(SD_CSV_PATH, "r");
+    if (f == NULL) {
+        f = fopen(SD_CSV_PATH, "w");
+        if (f == NULL) {
+            printf("Erreur : impossible de creer %s\n", SD_CSV_PATH);
+            return false;
+        }
+        fprintf(f,
+            "sample_index,timestamp_since_poweron_ms,real_time_clock,"
+            "temperature,pressure,humidity,gas_resistance,"
+            "heater_profile_step_index,gas_valid,heater_stable,error_code\n");
+    }
+    fclose(f);
+
+    printf("Carte SD montee, log CSV : %s\n", SD_CSV_PATH);
+    return true;
+}
+
+// Ajoute une ligne de mesure brute au fichier CSV sur la carte SD
+static void sd_log_sample(int64_t timestamp_ns, const struct bme68x_data *data)
+{
+    FILE *f = fopen(SD_CSV_PATH, "a");
+    if (f == NULL) {
+        printf("Erreur : impossible d'ouvrir %s en ecriture\n", SD_CSV_PATH);
+        return;
+    }
+
+    uint8_t gas_valid    = (data->status & BME68X_GASM_VALID_MSK) ? 1 : 0;
+    uint8_t heater_stable = (data->status & BME68X_HEAT_STAB_MSK) ? 1 : 0;
+
+    fprintf(f, "%lu,%lld,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d\n",
+            (unsigned long)sample_index,
+            (long long)(timestamp_ns / 1000000), // ms depuis le boot
+            0,                                    // real_time_clock inconnu (pas de RTC/NTP), 0 = missing
+            data->temperature,
+            data->pressure / 100.0,
+            data->humidity,
+            data->gas_resistance,
+            heater_step_cycle,
+            gas_valid,
+            heater_stable,
+            0);
+
+    fclose(f);
+
+    sample_index++;
+    heater_step_cycle = (heater_step_cycle + 1) % 10;
+}
 
 // Fonctions "glue" entre l'API Bosch et l'I2C ESP-IDF
 
@@ -156,6 +269,11 @@ static void bsec_loop(void)
             int8_t rslt = bme68x_get_data(sensor_settings.op_mode, &data, &n_fields, &bme);
 
             if (rslt == BME68X_OK && n_fields) {
+                // Log de la donnee brute sur la carte SD (avant filtrage BSEC)
+                if (sd_card != NULL) {
+                    sd_log_sample(timestamp_ns, &data);
+                }
+
                 // Construction des inputs pour BSEC
                 bsec_input_t inputs[4];
                 uint8_t n_inputs = 0;
@@ -233,6 +351,10 @@ static void bsec_loop(void)
 void app_main(void)
 {
     i2c_init();
+
+    if (!sd_init()) {
+        printf("Avertissement : SD non disponible, le log sur SD sera desactive\n");
+    }
 
     if (!bme68x_hw_init()) {
         printf("Arret : BME688 non detecte\n");
