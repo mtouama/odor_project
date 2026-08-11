@@ -35,10 +35,11 @@ static struct bme68x_dev bme;
 #define SD_PIN_CS     43
 #define SD_MOUNT_POINT "/sdcard"
 #define SD_CSV_PATH    SD_MOUNT_POINT "/bme_log.csv"
+#define I2C_XFER_TIMEOUT_MS 1000
 
 static sdmmc_card_t *sd_card = NULL;
 static uint32_t sample_index = 0;     // compteur global d'echantillons (sensor_index / data_point_id)
-static uint8_t  heater_step_cycle = 0; // pseudo heater_profile_step_index (0-9), voir remarque plus bas
+static uint8_t  heater_step_cycle = 0; // pour le moment à la mano, PENSER A CHANGER CA
 
 // Init de la carte SD en SPI + montage FATFS + creation de l'entete CSV si besoin
 static bool sd_init(void)
@@ -135,16 +136,24 @@ static void sd_log_sample(int64_t timestamp_ns, const struct bme68x_data *data)
 BME68X_INTF_RET_TYPE bme68x_i2c_read(uint8_t reg_addr, uint8_t *reg_data,
                                        uint32_t len, void *intf_ptr)
 {
-    return i2c_master_transmit_receive(dev_handle, &reg_addr, 1, reg_data, len, -1);
+    esp_err_t err = i2c_master_transmit_receive(dev_handle, &reg_addr, 1, reg_data, len, I2C_XFER_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        printf("Erreur lecture I2C: %s\n", esp_err_to_name(err));
+    }
+    return err;
 }
 
 BME68X_INTF_RET_TYPE bme68x_i2c_write(uint8_t reg_addr, const uint8_t *reg_data,
                                         uint32_t len, void *intf_ptr)
 {
-    uint8_t buf[len + 1];
+   uint8_t buf[len + 1];
     buf[0] = reg_addr;
     memcpy(&buf[1], reg_data, len);
-    return i2c_master_transmit(dev_handle, buf, len + 1, -1);
+    esp_err_t err = i2c_master_transmit(dev_handle, buf, len + 1, I2C_XFER_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        printf("Erreur ecriture I2C: %s\n", esp_err_to_name(err));
+    }
+    return err;
 }
 
 void bme68x_delay_us(uint32_t period, void *intf_ptr)
@@ -190,6 +199,28 @@ static bool bme68x_hw_init(void)
 
     printf("BME688 initialise avec succes, chip_id = 0x%X\n", bme.chip_id);
     return true;
+}
+
+static int consecutive_i2c_errors = 0;
+
+static void i2c_bus_recover(void)
+{
+    printf("Tentative de recuperation du bus I2C...\n");
+    gpio_set_direction(6, GPIO_MODE_OUTPUT); // SCL = GPIO6
+    gpio_set_direction(5, GPIO_MODE_INPUT);  // SDA = GPIO5, en lecture
+
+    for (int i = 0; i < 9; i++) {
+        gpio_set_level(6, 0);
+        esp_rom_delay_us(5);
+        gpio_set_level(6, 1);
+        esp_rom_delay_us(5);
+        if (gpio_get_level(5)) break; // SDA s'est liberee, plus besoin de continuer
+    }
+
+    // Reinitialise le bus I2C proprement apres la recuperation manuelle
+    i2c_init();
+    bme68x_hw_init();
+    consecutive_i2c_errors = 0;
 }
 
 // Init BSEC
@@ -269,6 +300,7 @@ static void bsec_loop(void)
             int8_t rslt = bme68x_get_data(sensor_settings.op_mode, &data, &n_fields, &bme);
 
             if (rslt == BME68X_OK && n_fields) {
+                consecutive_i2c_errors = 0;
                 // Log de la donnee brute sur la carte SD (avant filtrage BSEC)
                 if (sd_card != NULL) {
                     sd_log_sample(timestamp_ns, &data);
@@ -334,6 +366,10 @@ static void bsec_loop(void)
                 }
             } else {
                 printf("Pas de nouvelles donnees (rslt=%d)\n", rslt);
+                    consecutive_i2c_errors++;
+                    if (consecutive_i2c_errors >= 5) {
+                        i2c_bus_recover();
+                    }
             }
         }
 
